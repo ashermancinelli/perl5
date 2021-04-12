@@ -174,6 +174,7 @@ static const char C_thousands_sep[] = "";
  * the odds are extremely small that it would return these two strings for some
  * other locale.  Note that VMS in these two locales includes many non-ASCII
  * characters as controls and punctuation (below are hex bytes):
+ * XXX should handy.h fix this; also AIX?
  *   cntrl:  84-97 9B-9F
  *   punct:  A1-A3 A5 A7-AB B0-B3 B5-B7 B9-BD BF-CF D1-DD DF-EF F1-FD
  * Oddly, none there are listed as alphas, though some represent alphabetics
@@ -208,6 +209,23 @@ static const char C_thousands_sep[] = "";
 #  define toggle_locale_c(cat, locale)  toggle_locale_i(cat##_INDEX_, locale)
 #  define restore_toggled_locale_c(cat, locale)                             \
                              restore_toggled_locale_i(cat##_INDEX_, locale)
+
+/* Some platforms don't deal well with non-ASCII strings in locale category X
+ * when LC_CTYPE is a different category (actually, it's probably when X is
+ * UTF-8 and LC_CTYPE isn't, or vice versa).  There is explicit code to bring
+ * the categories into sync.  Most platforms don't seem to care when producing
+ * nl_langinfo() items, including the radix character, but cygwin does.  By
+ * OR'ing this into the newlocale() mask, we can, at no cost to us, cause the
+ * categories to automatically be in sync where newlocale is used. XXX */
+#  if defined(USE_LOCALE_CTYPE) && defined(LC_CTYPE_MASK)
+#    define SAFETY_MASK LC_CTYPE_MASK
+#  else
+#    define SAFETY_MASK 0
+#  endif
+
+#  ifdef __CYGWIN__
+#    define LC_CTYPE_MUST_MATCH
+#  endif
 
 /* Two parallel arrays indexed by our mapping of category numbers into small
  * non-negative indexes; first the locale categories Perl uses on this system,
@@ -1238,7 +1256,6 @@ S_emulate_setlocale_i(pTHX_
 
 #    ifndef USE_PL_CURLOCALES
         if (strNE(calculate_LC_ALL(PL_C_locale_obj), "C")) {
-            DEBUG_L(PerlIO_printf(Perl_debug_log, "%d: C==%s\n", __LINE__, calculate_LC_ALL(PL_C_locale_obj)));
             freelocale(PL_C_locale_obj);
             PL_C_locale_obj = newlocale(LC_ALL_MASK, "C", (locale_t) 0);
         }
@@ -1763,10 +1780,9 @@ S_new_numeric(pTHX_ const char *newnum)
 #    ifdef USE_POSIX_2008_LOCALE
 
     /* We keep a special object for easy switching to */
-    PL_underlying_numeric_obj = newlocale(LC_NUMERIC_MASK,
+    PL_underlying_numeric_obj = newlocale(LC_NUMERIC_MASK|SAFETY_MASK,
                                           PL_numeric_name,
                                           PL_underlying_numeric_obj);
-
 #    endif
 
     /* Find and save this locale's radix character. */
@@ -1849,7 +1865,6 @@ Perl_set_numeric_standard(pTHX)
 
     DEBUG_L(PerlIO_printf(Perl_debug_log,
                                   "Setting LC_NUMERIC locale to standard C\n"));
-    /* Maybe not in init? assert(PL_locale_mutex_depth > 0);*/
 
     void_setlocale_c(LC_NUMERIC, "C");
     PL_numeric_standard = TRUE;
@@ -1877,7 +1892,6 @@ Perl_set_numeric_underlying(pTHX)
 
     DEBUG_L(PerlIO_printf(Perl_debug_log, "Setting LC_NUMERIC locale to %s\n",
                                           PL_numeric_name));
-    /* Maybe not in init? assert(PL_locale_mutex_depth > 0);*/
 
     void_setlocale_c(LC_NUMERIC, PL_numeric_name);
     PL_numeric_underlying = TRUE;
@@ -1922,6 +1936,8 @@ S_new_ctype(pTHX_ const char *newctype)
 
     PERL_ARGS_ASSERT_NEW_CTYPE;
 
+    DEBUG_L(PerlIO_printf(Perl_debug_log, "Entering new_ctype(%s)\n", newctype));
+
     /* No change means no-op */
     if (PL_ctype_name && strEQ(PL_ctype_name, newctype)) {
         return;
@@ -1950,6 +1966,7 @@ S_new_ctype(pTHX_ const char *newctype)
     PL_ctype_name = newctype;
 
     PL_in_utf8_turkic_locale = FALSE;
+    DEBUG_L(PerlIO_printf(Perl_debug_log, "is utf8=%d\n", PL_in_utf8_CTYPE_locale));
 
     if (isNAME_C_OR_POSIX(PL_ctype_name)) {
         Copy(PL_fold, PL_fold_locale, 256, U8);
@@ -3036,9 +3053,26 @@ Perl_localeconv()
 
     return newHV();
 
-#else
+#elif ! defined(USE_LOCALE_NUMERIC)
 
     return my_localeconv(0);
+
+#else
+
+    HV * result;
+    bool toggled = FALSE;
+
+    if (! PL_numeric_underlying) {
+        set_numeric_underlying();
+        toggled = TRUE;
+    }
+
+    result = my_localeconv(0);
+
+    if (toggled) {
+        set_numeric_standard();
+    }
+    return result;
 
 #endif
 
@@ -3146,7 +3180,7 @@ S_my_localeconv(pTHX_ const int item)
 
         /* Just create a new locale object with what we've got, but using the
          * underlying LC_NUMERIC locale */
-        with_numeric = newlocale(LC_NUMERIC_MASK, PL_numeric_name, with_numeric);
+        with_numeric = newlocale(LC_NUMERIC_MASK|SAFETY_MASK, PL_numeric_name, with_numeric);
 
         retval = copy_localeconv(aTHX_ localeconv_l(with_numeric),
                                        numeric_locale_is_utf8,
@@ -3921,11 +3955,18 @@ S_my_langinfo_i(pTHX_
         locale_t cur;
         bool need_free = FALSE;
 
+#    ifndef LC_CTYPE_MUST_MATCH
+
         if (locale == NULL) {
             cur = use_curlocale_scratch();
         }
-        else {
-            cur = newlocale(category_masks[cat_index], locale, (locale_t) 0);
+        else
+
+#    endif
+
+        {
+            cur = newlocale(category_masks[cat_index]|SAFETY_MASK,
+                            locale, (locale_t) 0);
             need_free = TRUE;
         }
 
@@ -3973,6 +4014,10 @@ S_my_langinfo_i(pTHX_
 /* And the third and final completion is where we have to emulate
  * nl_langinfo().  There are various possibilities depending on the
  * Configuration */
+
+#    ifdef LC_CTYPE_MUST_MATCH
+#      error Unimplemented
+#    endif
 
     /* Almost all the items will have ASCII return values.  Set that here, and
      * override if necessary */
@@ -4763,6 +4808,7 @@ Perl_init_i18nl10n(pTHX_ int printwarn)
 #    ifdef USE_LOCALE_NUMERIC
 
     PL_underlying_numeric_obj = duplocale(PL_C_locale_obj);
+        DEBUG_L(PerlIO_printf(Perl_debug_log, "%d: %s==%p duped from C obj=%p\n", __LINE__, PL_numeric_name, PL_underlying_numeric_obj, PL_C_locale_obj  ));
 
 #    endif
 #  endif
@@ -6772,10 +6818,11 @@ Perl_thread_locale_init(pTHX)
                           "new thread, initial locale is %s\n",
                           porcelain_setlocale(LC_ALL, NULL)));
 
+#  if 0
     if (! sync_locale()) {  /* Side effect of going to per-thread if avail */
-        locale_panic_("Thread unexpectedly started not in global locale");
+        /*locale_panic_("Thread unexpectedly started not in global locale");*/
     }
-
+#  endif
 #  ifdef LC_ALL
 
     void_setlocale_c(LC_ALL, "C");
@@ -6793,6 +6840,9 @@ Perl_thread_locale_init(pTHX)
 
     new_LC_ALL(NULL);
 
+#  ifndef USE_THREAD_SAFE_LOCALE
+    PL_perl_controls_locale = TRUE;
+#  endif
 #endif
 
 }
